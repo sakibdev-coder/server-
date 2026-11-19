@@ -5,9 +5,17 @@ import mongoose from "mongoose";
 
 const app = express();
 const port = process.env.PORT || 5000;
-const clientUrl = process.env.CLIENT_URL || "http://localhost:3000";
+const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
-app.use(cors({ origin: clientUrl }));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Origin is not allowed by the API CORS policy."));
+  }
+}));
 app.use(express.json());
 
 const equipmentSchema = new mongoose.Schema({
@@ -32,7 +40,11 @@ const bookingSchema = new mongoose.Schema({
 const Equipment = mongoose.model("Equipment", equipmentSchema);
 const Booking = mongoose.model("Booking", bookingSchema);
 
-app.get("/api/health", (_req, res) => res.json({ status: "ok", service: "equiply-api" }));
+app.get("/api/health", (_req, res) => res.json({
+  status: "ok",
+  service: "equiply-api",
+  database: mongoose.connection.readyState === 1 ? "connected" : "demo"
+}));
 
 app.get("/api/equipment", async (_req, res, next) => {
   try {
@@ -53,9 +65,14 @@ app.post("/api/bookings", async (req, res, next) => {
   } catch (error) { return next(error); }
 });
 
+app.use("/api", (_req, res) => res.status(404).json({ message: "API route not found." }));
+
 app.use((error, _req, res, _next) => {
   console.error(error);
-  res.status(500).json({ message: "Something went wrong on the server." });
+  if (error.message === "Origin is not allowed by the API CORS policy.") {
+    return res.status(403).json({ message: error.message });
+  }
+  return res.status(500).json({ message: "Something went wrong on the server." });
 });
 
 async function start() {
