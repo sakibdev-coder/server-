@@ -6,6 +6,8 @@ import { OAuth2Client } from "google-auth-library";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import Stripe from "stripe";
+import { toNodeHandler } from "better-auth/node";
+import { betterAuthInstance, betterAuthMongoClient } from "./better-auth.js";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -15,6 +17,7 @@ const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 app.use(cors({ origin(origin, callback) { if (!origin || allowedOrigins.includes(origin)) return callback(null, true); callback(new Error("Origin is not allowed")); } }));
+app.all("/api/better-auth/*", toNodeHandler(betterAuthInstance));
 app.use(express.json({ limit: "2mb" }));
 
 const userSchema = new mongoose.Schema({
@@ -319,7 +322,13 @@ app.use("/api", (_req, res) => res.status(404).json({ message: "API route not fo
 app.use((error, _req, res, _next) => { console.error(error); res.status(error.message === "Origin is not allowed" ? 403 : 500).json({ message: error.message === "Origin is not allowed" ? error.message : "Something went wrong." }); });
 
 async function start() {
-  if (process.env.MONGODB_URI) { try { await mongoose.connect(process.env.MONGODB_URI); console.log("Connected to MongoDB"); } catch (error) { console.error(error.message); process.exit(1); } }
+  if (process.env.MONGODB_URI) {
+    try {
+      await mongoose.connect(process.env.MONGODB_URI);
+      if (betterAuthMongoClient) await betterAuthMongoClient.connect();
+      console.log("Connected to MongoDB");
+    } catch (error) { console.error(error.message); process.exit(1); }
+  }
   app.listen(port, () => console.log(`Equiply API listening on ${port}`));
 }
 start();
