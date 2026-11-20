@@ -5,173 +5,261 @@ import express from "express";
 import { OAuth2Client } from "google-auth-library";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
-const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000").split(",").map((x) => x.trim()).filter(Boolean);
 const jwtSecret = process.env.JWT_SECRET;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error("Origin is not allowed by the API CORS policy."));
-  }
-}));
-app.use(express.json());
+app.use(cors({ origin(origin, callback) { if (!origin || allowedOrigins.includes(origin)) return callback(null, true); callback(new Error("Origin is not allowed")); } }));
+app.use(express.json({ limit: "2mb" }));
+
+const userSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true }, email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  photo: { type: String, default: "" }, phone: { type: String, default: "" }, address: { type: String, default: "" },
+  passwordHash: String, googleId: String, role: { type: String, enum: ["Customer", "Owner", "Admin"], default: "Customer" }
+}, { timestamps: true });
 
 const equipmentSchema = new mongoose.Schema({
-  name: { type: String, required: true, trim: true },
-  category: { type: String, required: true },
-  location: { type: String, required: true },
-  price: { type: Number, required: true, min: 0 },
-  rating: { type: Number, default: 5 },
-  image: { type: String, required: true },
-  ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User" }
+  name: { type: String, required: true, trim: true }, description: { type: String, default: "" },
+  category: { type: String, required: true }, location: { type: String, required: true },
+  price: { type: Number, required: true, min: 0 }, rentalType: { type: String, enum: ["Daily", "Weekly", "Monthly"], default: "Daily" },
+  quantity: { type: Number, required: true, min: 1 }, condition: { type: String, default: "Good" }, brand: String, model: String,
+  image: { type: String, required: true }, terms: { type: String, default: "" },
+  status: { type: String, enum: ["Pending", "Approved", "Rejected"], default: "Pending" },
+  ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true }, rating: { type: Number, default: 5 }
 }, { timestamps: true });
 
 const bookingSchema = new mongoose.Schema({
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  ownerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   equipmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Equipment", required: true },
-  renterName: { type: String, required: true, trim: true },
-  renterEmail: { type: String, required: true, trim: true },
-  startDate: { type: Date, required: true },
-  endDate: { type: Date, required: true },
-  status: { type: String, enum: ["pending", "accepted", "declined"], default: "pending" }
+  startDate: { type: Date, required: true }, endDate: { type: Date, required: true }, quantity: { type: Number, required: true, min: 1 },
+  contactNumber: String, deliveryAddress: String, notes: String, totalAmount: { type: Number, required: true, min: 0 },
+  paymentStatus: { type: String, enum: ["Pending", "Paid", "Failed"], default: "Pending" },
+  bookingStatus: { type: String, enum: ["Pending", "Confirmed", "Rejected", "Completed"], default: "Pending" },
+  transactionId: String, paymentProvider: { type: String, default: "Stripe" }
 }, { timestamps: true });
 
-const userSchema = new mongoose.Schema({
-  name: { type: String, required: true, trim: true },
-  email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-  photo: { type: String, default: "" },
-  passwordHash: { type: String },
-  googleId: { type: String },
-  role: { type: String, enum: ["Customer", "Owner", "Admin"], default: "Customer" }
+const favoriteSchema = new mongoose.Schema({
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  equipmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Equipment", required: true }
+}, { timestamps: true });
+favoriteSchema.index({ customerId: 1, equipmentId: 1 }, { unique: true });
+
+const paymentSchema = new mongoose.Schema({
+  bookingId: { type: mongoose.Schema.Types.ObjectId, ref: "Booking" }, customerId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  amount: Number, currency: { type: String, default: "usd" }, stripeSessionId: String, transactionId: String,
+  status: { type: String, enum: ["Pending", "Paid", "Failed"], default: "Pending" }
 }, { timestamps: true });
 
+const reviewSchema = new mongoose.Schema({
+  customerId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  equipmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Equipment", required: true },
+  rating: { type: Number, min: 1, max: 5, required: true }, comment: { type: String, required: true }
+}, { timestamps: true });
+
+const User = mongoose.model("User", userSchema);
 const Equipment = mongoose.model("Equipment", equipmentSchema);
 const Booking = mongoose.model("Booking", bookingSchema);
-const User = mongoose.model("User", userSchema);
+const Favorite = mongoose.model("Favorite", favoriteSchema);
+const Payment = mongoose.model("Payment", paymentSchema);
+const Review = mongoose.model("Review", reviewSchema);
 
-function createToken(user) {
-  if (!jwtSecret) throw new Error("JWT_SECRET is not configured.");
-  return jwt.sign({ sub: user._id.toString(), role: user.role }, jwtSecret, { expiresIn: "7d" });
+function auth(req, res, next) {
+  const token = req.headers.authorization?.startsWith("Bearer ") ? req.headers.authorization.slice(7) : null;
+  if (!token) return res.status(401).json({ message: "Authentication is required." });
+  try { if (!jwtSecret) return res.status(500).json({ message: "JWT_SECRET is not configured." }); req.auth = jwt.verify(token, jwtSecret); next(); }
+  catch { res.status(401).json({ message: "Your session is invalid or expired." }); }
 }
+function roles(...allowed) { return (req, res, next) => allowed.includes(req.auth?.role) ? next() : res.status(403).json({ message: "Permission denied." }); }
+function tokenFor(user) { if (!jwtSecret) throw new Error("JWT_SECRET is not configured."); return jwt.sign({ sub: user._id.toString(), role: user.role }, jwtSecret, { expiresIn: "7d" }); }
+function publicUser(user) { return { id: user._id.toString(), name: user.name, email: user.email, photo: user.photo, phone: user.phone, address: user.address, role: user.role, createdAt: user.createdAt }; }
+function connected(res) { if (mongoose.connection.readyState !== 1) { res.status(503).json({ message: "MongoDB is not connected." }); return false; } return true; }
 
-function serializeUser(user) {
-  return { id: user._id.toString(), name: user.name, email: user.email, photo: user.photo, role: user.role };
-}
-
-function authMiddleware(req, res, next) {
-  const header = req.headers.authorization;
-  if (!header?.startsWith("Bearer ")) return res.status(401).json({ message: "Authentication is required." });
-  try {
-    if (!jwtSecret) return res.status(500).json({ message: "JWT_SECRET is not configured." });
-    const payload = jwt.verify(header.slice(7), jwtSecret);
-    req.auth = payload;
-    return next();
-  } catch { return res.status(401).json({ message: "Your session is invalid or expired." }); }
-}
-
-function requireRoles(...roles) {
-  return (req, res, next) => roles.includes(req.auth?.role)
-    ? next() : res.status(403).json({ message: "You do not have permission for this action." });
-}
-
-app.get("/api/health", (_req, res) => res.json({
-  status: "ok",
-  service: "equiply-api",
-  database: mongoose.connection.readyState === 1 ? "connected" : "demo"
-}));
+app.get("/api/health", (_req, res) => res.json({ status: "ok", database: mongoose.connection.readyState === 1 ? "connected" : "demo" }));
 
 app.post("/api/auth/register", async (req, res, next) => {
   try {
     const { name, email, photo, password } = req.body;
-    if (!name || !email || !password) return res.status(400).json({ message: "Name, email, and password are required." });
+    if (!name || !email || !password) return res.status(400).json({ message: "Name, email and password are required." });
     if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters." });
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: "Registration requires a database connection." });
-    const normalizedEmail = email.toLowerCase().trim();
-    if (await User.exists({ email: normalizedEmail })) return res.status(409).json({ message: "An account with this email already exists." });
-    const user = await User.create({ name: name.trim(), email: normalizedEmail, photo: photo || "", passwordHash: await bcrypt.hash(password, 12) });
-    return res.status(201).json({ token: createToken(user), user: serializeUser(user) });
-  } catch (error) { return next(error); }
+    if (!connected(res)) return;
+    const normalized = email.toLowerCase().trim();
+    if (await User.exists({ email: normalized })) return res.status(409).json({ message: "An account with this email already exists." });
+    const user = await User.create({ name: name.trim(), email: normalized, photo: photo || "", passwordHash: await bcrypt.hash(password, 12) });
+    res.status(201).json({ token: tokenFor(user), user: publicUser(user) });
+  } catch (error) { next(error); }
 });
-
 app.post("/api/auth/login", async (req, res, next) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ message: "Email and password are required." });
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: "Login requires a database connection." });
-    const user = await User.findOne({ email: email.toLowerCase().trim() });
-    if (!user?.passwordHash || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ message: "Invalid email or password." });
-    return res.json({ token: createToken(user), user: serializeUser(user) });
-  } catch (error) { return next(error); }
+    if (!connected(res)) return;
+    const user = await User.findOne({ email: req.body.email?.toLowerCase().trim() });
+    if (!user?.passwordHash || !(await bcrypt.compare(req.body.password || "", user.passwordHash))) return res.status(401).json({ message: "Invalid email or password." });
+    res.json({ token: tokenFor(user), user: publicUser(user) });
+  } catch (error) { next(error); }
 });
-
 app.post("/api/auth/google", async (req, res, next) => {
   try {
-    if (!googleClient || !process.env.GOOGLE_CLIENT_ID) return res.status(503).json({ message: "Google login is not configured yet." });
-    const { credential } = req.body;
-    if (!credential) return res.status(400).json({ message: "Google credential is required." });
-    const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: process.env.GOOGLE_CLIENT_ID });
+    if (!googleClient) return res.status(503).json({ message: "Google login is not configured." });
+    const ticket = await googleClient.verifyIdToken({ idToken: req.body.credential, audience: process.env.GOOGLE_CLIENT_ID });
     const profile = ticket.getPayload();
-    if (!profile?.email || !profile.email_verified) return res.status(401).json({ message: "Google account email could not be verified." });
+    if (!profile?.email || !profile.email_verified) return res.status(401).json({ message: "Google email could not be verified." });
     let user = await User.findOne({ email: profile.email.toLowerCase() });
     if (!user) user = await User.create({ name: profile.name || "Equiply customer", email: profile.email.toLowerCase(), photo: profile.picture || "", googleId: profile.sub, role: "Customer" });
-    return res.json({ token: createToken(user), user: serializeUser(user) });
-  } catch (error) { return next(error); }
+    res.json({ token: tokenFor(user), user: publicUser(user) });
+  } catch (error) { next(error); }
+});
+app.get("/api/auth/me", auth, async (req, res) => {
+  if (!connected(res)) return;
+  const user = await User.findById(req.auth.sub);
+  if (!user) return res.status(404).json({ message: "User not found." });
+  res.json({ user: publicUser(user) });
+});
+app.put("/api/profile", auth, async (req, res) => {
+  if (!connected(res)) return;
+  const allowed = ["name", "photo", "phone", "address"];
+  const update = {};
+  for (const key of allowed) if (typeof req.body[key] === "string") update[key] = req.body[key].trim();
+  const user = await User.findByIdAndUpdate(req.auth.sub, update, { new: true, runValidators: true });
+  res.json({ user: publicUser(user) });
 });
 
-app.get("/api/auth/me", authMiddleware, async (req, res, next) => {
-  try {
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: "Profile service is not connected to the database." });
-    const user = await User.findById(req.auth.sub);
-    if (!user) return res.status(404).json({ message: "User account was not found." });
-    return res.json({ user: serializeUser(user) });
-  } catch (error) { return next(error); }
+app.get("/api/equipment", async (req, res) => {
+  if (!connected(res)) return;
+  const { search, category, rentalType, minPrice, maxPrice, availability, sort } = req.query;
+  const filter = { status: "Approved" };
+  if (search) filter.$or = [{ name: { $regex: search, $options: "i" } }, { location: { $regex: search, $options: "i" } }];
+  if (category) filter.category = category;
+  if (rentalType) filter.rentalType = rentalType;
+  if (minPrice || maxPrice) filter.price = { ...(minPrice && { $gte: Number(minPrice) }), ...(maxPrice && { $lte: Number(maxPrice) }) };
+  if (availability === "Available") filter.quantity = { $gt: 0 };
+  const sortOption = sort === "priceAsc" ? { price: 1 } : sort === "priceDesc" ? { price: -1 } : { createdAt: -1 };
+  const items = await Equipment.find(filter).populate("ownerId", "name photo").sort(sortOption).limit(100);
+  res.json(items);
+});
+app.get("/api/equipment/featured", async (_req, res) => {
+  if (!connected(res)) return;
+  res.json(await Equipment.find({ status: "Approved" }).populate("ownerId", "name").sort({ rating: -1, createdAt: -1 }).limit(6));
+});
+app.get("/api/equipment/:id", async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: "Equipment not found." });
+  if (!connected(res)) return;
+  const item = await Equipment.findById(req.params.id).populate("ownerId", "name email photo");
+  if (!item) return res.status(404).json({ message: "Equipment not found." });
+  res.json(item);
+});
+app.post("/api/equipment", auth, roles("Owner", "Admin"), async (req, res) => {
+  if (!connected(res)) return;
+  const item = await Equipment.create({ ...req.body, ownerId: req.auth.sub, status: "Pending" });
+  res.status(201).json(item);
+});
+app.put("/api/equipment/:id", auth, async (req, res) => {
+  if (!connected(res)) return;
+  const item = await Equipment.findById(req.params.id);
+  if (!item) return res.status(404).json({ message: "Equipment not found." });
+  if (item.ownerId.toString() !== req.auth.sub && req.auth.role !== "Admin") return res.status(403).json({ message: "Permission denied." });
+  Object.assign(item, req.body);
+  if (req.auth.role !== "Admin") item.status = "Pending";
+  await item.save(); res.json(item);
+});
+app.delete("/api/equipment/:id", auth, async (req, res) => {
+  if (!connected(res)) return;
+  const item = await Equipment.findById(req.params.id);
+  if (!item) return res.status(404).json({ message: "Equipment not found." });
+  if (item.ownerId.toString() !== req.auth.sub && req.auth.role !== "Admin") return res.status(403).json({ message: "Permission denied." });
+  await item.deleteOne(); res.json({ message: "Equipment deleted." });
+});
+app.get("/api/owner/equipment", auth, roles("Owner", "Admin"), async (req, res) => {
+  if (!connected(res)) return;
+  res.json(await Equipment.find({ ownerId: req.auth.sub }).sort({ createdAt: -1 }));
 });
 
-app.get("/api/equipment", async (_req, res, next) => {
-  try {
-    if (mongoose.connection.readyState !== 1) return res.json([]);
-    const items = await Equipment.find().sort({ createdAt: -1 }).limit(50);
-    return res.json(items);
-  } catch (error) { return next(error); }
+app.post("/api/favorites/:equipmentId", auth, roles("Customer", "Owner", "Admin"), async (req, res) => {
+  if (!connected(res)) return;
+  await Favorite.findOneAndUpdate({ customerId: req.auth.sub, equipmentId: req.params.equipmentId }, {}, { upsert: true, new: true });
+  res.status(201).json({ message: "Added to favorites." });
+});
+app.delete("/api/favorites/:equipmentId", auth, async (req, res) => {
+  await Favorite.findOneAndDelete({ customerId: req.auth.sub, equipmentId: req.params.equipmentId });
+  res.json({ message: "Removed from favorites." });
+});
+app.get("/api/favorites", auth, async (req, res) => {
+  if (!connected(res)) return;
+  res.json(await Favorite.find({ customerId: req.auth.sub }).populate("equipmentId").sort({ createdAt: -1 }));
 });
 
-app.post("/api/bookings", authMiddleware, requireRoles("Customer", "Owner", "Admin"), async (req, res, next) => {
-  try {
-    const { equipmentId, renterName, renterEmail, startDate, endDate } = req.body;
-    if (!equipmentId || !renterName || !renterEmail || !startDate || !endDate) return res.status(400).json({ message: "All booking fields are required." });
-    if (new Date(endDate) <= new Date(startDate)) return res.status(400).json({ message: "Return date must be after pick-up date." });
-    if (mongoose.connection.readyState !== 1) return res.status(503).json({ message: "Booking service is not connected to the database." });
-    const booking = await Booking.create({ equipmentId, renterName, renterEmail, startDate, endDate });
-    return res.status(201).json(booking);
-  } catch (error) { return next(error); }
+app.post("/api/bookings", auth, roles("Customer", "Owner", "Admin"), async (req, res) => {
+  if (!connected(res)) return;
+  const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } = req.body;
+  const equipment = await Equipment.findById(equipmentId);
+  if (!equipment || equipment.status !== "Approved") return res.status(404).json({ message: "Approved equipment not found." });
+  if (Number(quantity) > equipment.quantity) return res.status(400).json({ message: "Requested quantity is not available." });
+  const overlap = await Booking.countDocuments({ equipmentId, paymentStatus: "Paid", bookingStatus: { $ne: "Rejected" }, startDate: { $lt: new Date(endDate) }, endDate: { $gt: new Date(startDate) } });
+  if (overlap > 0) return res.status(409).json({ message: "Equipment is unavailable for the selected dates." });
+  const days = Math.max(1, Math.ceil((new Date(endDate) - new Date(startDate)) / 86400000));
+  const unitDays = equipment.rentalType === "Monthly" ? 30 : equipment.rentalType === "Weekly" ? 7 : 1;
+  const totalAmount = equipment.price * Math.ceil(days / unitDays) * Number(quantity);
+  const booking = await Booking.create({ customerId: req.auth.sub, ownerId: equipment.ownerId, equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes, totalAmount });
+  res.status(201).json(booking);
+});
+app.get("/api/customer/rentals", auth, roles("Customer", "Owner", "Admin"), async (req, res) => {
+  if (!connected(res)) return;
+  res.json(await Booking.find({ customerId: req.auth.sub }).populate("equipmentId").populate("ownerId", "name").sort({ createdAt: -1 }));
+});
+app.get("/api/owner/rentals", auth, roles("Owner", "Admin"), async (req, res) => {
+  if (!connected(res)) return;
+  res.json(await Booking.find({ ownerId: req.auth.sub }).populate("equipmentId").populate("customerId", "name email phone").sort({ createdAt: -1 }));
 });
 
-app.get("/api/owner/dashboard", authMiddleware, requireRoles("Owner", "Admin"), async (_req, res) => {
-  res.json({ message: "Owner dashboard access granted." });
+app.post("/api/payments/checkout", auth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ message: "Stripe is not configured." });
+  if (!connected(res)) return;
+  const booking = await Booking.findById(req.body.bookingId).populate("equipmentId");
+  if (!booking) return res.status(404).json({ message: "Booking not found." });
+  if (booking.customerId.toString() !== req.auth.sub) return res.status(403).json({ message: "Permission denied." });
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment", success_url: `${allowedOrigins[0]}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${allowedOrigins[0]}/payment/cancel`, customer_email: (await User.findById(req.auth.sub)).email,
+    line_items: [{ quantity: 1, price_data: { currency: "usd", unit_amount: Math.round(booking.totalAmount * 100), product_data: { name: booking.equipmentId.name } } }],
+    metadata: { bookingId: booking._id.toString(), customerId: req.auth.sub }
+  });
+  await Payment.create({ bookingId: booking._id, customerId: req.auth.sub, amount: booking.totalAmount, stripeSessionId: session.id, status: "Pending" });
+  res.json({ url: session.url, sessionId: session.id });
 });
+app.post("/api/payments/verify", auth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ message: "Stripe is not configured." });
+  const session = await stripe.checkout.sessions.retrieve(req.body.sessionId);
+  if (session.payment_status !== "paid") return res.status(400).json({ message: "Payment is not complete." });
+  const booking = await Booking.findById(session.metadata.bookingId);
+  if (!booking) return res.status(404).json({ message: "Booking not found." });
+  booking.paymentStatus = "Paid"; booking.bookingStatus = "Confirmed"; booking.transactionId = session.payment_intent?.toString() || session.id;
+  await booking.save();
+  await Payment.findOneAndUpdate({ stripeSessionId: session.id }, { status: "Paid", transactionId: booking.transactionId });
+  res.json({ booking, status: "paid" });
+});
+
+app.get("/api/admin/users", auth, roles("Admin"), async (_req, res) => res.json(await User.find().sort({ createdAt: -1 })));
+app.put("/api/admin/users/:id/role", auth, roles("Admin"), async (req, res) => {
+  if (!["Customer", "Owner", "Admin"].includes(req.body.role)) return res.status(400).json({ message: "Invalid role." });
+  const user = await User.findByIdAndUpdate(req.params.id, { role: req.body.role }, { new: true });
+  res.json(publicUser(user));
+});
+app.get("/api/admin/equipment", auth, roles("Admin"), async (_req, res) => res.json(await Equipment.find().populate("ownerId", "name email").sort({ createdAt: -1 })));
+app.put("/api/admin/equipment/:id/status", auth, roles("Admin"), async (req, res) => {
+  if (!["Pending", "Approved", "Rejected"].includes(req.body.status)) return res.status(400).json({ message: "Invalid status." });
+  res.json(await Equipment.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true }));
+});
+app.get("/api/admin/rentals", auth, roles("Admin"), async (_req, res) => res.json(await Booking.find().populate("customerId", "name email").populate("ownerId", "name email").populate("equipmentId").sort({ createdAt: -1 })));
 
 app.use("/api", (_req, res) => res.status(404).json({ message: "API route not found." }));
-
-app.use((error, _req, res, _next) => {
-  console.error(error);
-  if (error.message === "Origin is not allowed by the API CORS policy.") {
-    return res.status(403).json({ message: error.message });
-  }
-  return res.status(500).json({ message: "Something went wrong on the server." });
-});
+app.use((error, _req, res, _next) => { console.error(error); res.status(error.message === "Origin is not allowed" ? 403 : 500).json({ message: error.message === "Origin is not allowed" ? error.message : "Something went wrong." }); });
 
 async function start() {
-  if (process.env.MONGODB_URI) {
-    try { await mongoose.connect(process.env.MONGODB_URI); console.log("Connected to MongoDB"); }
-    catch (error) { console.error("MongoDB connection failed:", error.message); process.exitCode = 1; return; }
-  } else console.warn("MONGODB_URI is not set; API is running in demo mode.");
-  app.listen(port, () => console.log(`Equiply API listening on port ${port}`));
+  if (process.env.MONGODB_URI) { try { await mongoose.connect(process.env.MONGODB_URI); console.log("Connected to MongoDB"); } catch (error) { console.error(error.message); process.exit(1); } }
+  app.listen(port, () => console.log(`Equiply API listening on ${port}`));
 }
-
 start();
