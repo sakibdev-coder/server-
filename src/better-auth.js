@@ -6,16 +6,25 @@ import { MongoClient } from "mongodb";
 
 const mongoUri = process.env.MONGODB_URI;
 export const betterAuthMongoClient = mongoUri ? new MongoClient(mongoUri) : null;
+const configuredOrigins = (process.env.CLIENT_URL || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const localOrigins = [
+  "http://localhost:3000",
+  "http://localhost:3001",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:3001"
+];
 
 export const betterAuthInstance = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET || process.env.JWT_SECRET,
   baseURL: process.env.BETTER_AUTH_URL,
   basePath: "/api/better-auth",
   trustedOrigins: [
-    "http://localhost:3000",
-    "http://localhost:5001",
-    ...(process.env.CLIENT_URL || "").split(",").map((origin) => origin.trim())
-  ].filter(Boolean),
+    ...localOrigins,
+    ...configuredOrigins
+  ],
   database: betterAuthMongoClient
     ? mongodbAdapter(betterAuthMongoClient.db(process.env.MONGODB_DATABASE || "equiply"), {
         client: betterAuthMongoClient

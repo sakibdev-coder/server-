@@ -6,18 +6,33 @@ import { OAuth2Client } from "google-auth-library";
 import jwt from "jsonwebtoken";
 import mongoose from "mongoose";
 import Stripe from "stripe";
-import { toNodeHandler } from "better-auth/node";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { betterAuthInstance, betterAuthMongoClient } from "./better-auth.js";
 
 const app = express();
 const port = process.env.PORT || 5000;
-const allowedOrigins = (process.env.CLIENT_URL || "http://localhost:3000").split(",").map((x) => x.trim()).filter(Boolean);
+const configuredOrigins = (process.env.CLIENT_URL || "").split(",").map((x) => x.trim()).filter(Boolean);
+const allowedOrigins = new Set([
+  "http://localhost:3000",
+  "http://localhost:3001",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:3001",
+  ...configuredOrigins
+]);
 const jwtSecret = process.env.JWT_SECRET;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
-app.use(cors({ origin(origin, callback) { if (!origin || allowedOrigins.includes(origin)) return callback(null, true); callback(new Error("Origin is not allowed")); } }));
-app.all("/api/better-auth/*", toNodeHandler(betterAuthInstance));
+app.use(cors({
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    callback(new Error("Origin is not allowed"));
+  },
+  credentials: true
+}));
+const betterAuthHandler = toNodeHandler(betterAuthInstance);
+app.all("/api/better-auth", betterAuthHandler);
+app.all("/api/better-auth/*", betterAuthHandler);
 app.use(express.json({ limit: "2mb" }));
 
 const userSchema = new mongoose.Schema({
@@ -115,6 +130,27 @@ app.post("/api/auth/google", async (req, res, next) => {
     if (!profile?.email || !profile.email_verified) return res.status(401).json({ message: "Google email could not be verified." });
     let user = await User.findOne({ email: profile.email.toLowerCase() });
     if (!user) user = await User.create({ name: profile.name || "Equiply customer", email: profile.email.toLowerCase(), photo: profile.picture || "", googleId: profile.sub, role: "Customer" });
+    res.json({ token: tokenFor(user), user: publicUser(user) });
+  } catch (error) { next(error); }
+});
+app.get("/api/auth/google-session", async (req, res, next) => {
+  try {
+    if (!connected(res)) return;
+    const session = await betterAuthInstance.api.getSession({
+      headers: fromNodeHeaders(req.headers)
+    });
+    if (!session?.user?.email) return res.status(401).json({ message: "Google session not found." });
+    const email = session.user.email.toLowerCase();
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = await User.create({
+        name: session.user.name || "Equiply customer",
+        email,
+        photo: session.user.image || "",
+        googleId: session.user.id,
+        role: "Customer"
+      });
+    }
     res.json({ token: tokenFor(user), user: publicUser(user) });
   } catch (error) { next(error); }
 });
