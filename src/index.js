@@ -10,7 +10,7 @@ import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { betterAuthInstance, betterAuthMongoClient } from "./better-auth.js";
 
 const app = express();
-const port = process.env.PORT || 5000;
+const port = process.env.PORT || 5001;
 const configuredOrigins = (process.env.CLIENT_URL || "").split(",").map((x) => x.trim()).filter(Boolean);
 const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null;
 const allowedOrigins = new Set([
@@ -22,6 +22,7 @@ const allowedOrigins = new Set([
   ...(process.env.BETTER_AUTH_URL ? [process.env.BETTER_AUTH_URL] : []),
   ...(vercelUrl ? [vercelUrl] : [])
 ]);
+const clientAppUrl = configuredOrigins[0] || "http://localhost:3000";
 const jwtSecret = process.env.JWT_SECRET;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
@@ -110,6 +111,8 @@ app.post("/api/auth/register", async (req, res, next) => {
     const { name, email, photo, password } = req.body;
     if (!name || !email || !password) return res.status(400).json({ message: "Name, email and password are required." });
     if (password.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters." });
+    if (!/[A-Z]/.test(password)) return res.status(400).json({ message: "Password must include an uppercase letter." });
+    if (!/[a-z]/.test(password)) return res.status(400).json({ message: "Password must include a lowercase letter." });
     if (!connected(res)) return;
     const normalized = email.toLowerCase().trim();
     if (await User.exists({ email: normalized })) return res.status(409).json({ message: "An account with this email already exists." });
@@ -146,6 +149,7 @@ app.get("/api/auth/google-session", async (req, res, next) => {
     const email = session.user.email.toLowerCase();
     let user = await User.findOne({ email });
     if (!user) {
+      // Google social sign-up always starts as Customer per assignment RBAC rules.
       user = await User.create({
         name: session.user.name || "Equiply customer",
         email,
@@ -153,6 +157,11 @@ app.get("/api/auth/google-session", async (req, res, next) => {
         googleId: session.user.id,
         role: "Customer"
       });
+    } else {
+      const sync = {};
+      if (!user.googleId && session.user.id) sync.googleId = session.user.id;
+      if (!user.photo && session.user.image) sync.photo = session.user.image;
+      if (Object.keys(sync).length) user = await User.findByIdAndUpdate(user._id, sync, { new: true });
     }
     res.json({ token: tokenFor(user), user: publicUser(user) });
   } catch (error) { next(error); }
@@ -168,7 +177,9 @@ app.put("/api/profile", verifyToken, async (req, res) => {
   const allowed = ["name", "photo", "phone", "address"];
   const update = {};
   for (const key of allowed) if (typeof req.body[key] === "string") update[key] = req.body[key].trim();
+  if (!update.name) return res.status(400).json({ message: "Name is required." });
   const user = await User.findByIdAndUpdate(req.auth.sub, update, { new: true, runValidators: true });
+  if (!user) return res.status(404).json({ message: "User not found." });
   res.json({ user: publicUser(user) });
 });
 
@@ -176,9 +187,15 @@ app.get("/api/equipment", async (req, res) => {
   if (!connected(res)) return;
   const { search, category, rentalType, minPrice, maxPrice, availability, sort } = req.query;
   const filter = { status: "Approved" };
-  if (search) filter.$or = [{ name: { $regex: search, $options: "i" } }, { category: { $regex: search, $options: "i" } }];
+  if (search) {
+    filter.$or = [
+      { name: { $regex: search, $options: "i" } },
+      { location: { $regex: search, $options: "i" } },
+      { category: { $regex: search, $options: "i" } }
+    ];
+  }
   if (category && category !== "All equipment") filter.category = category;
-  if (rentalType) filter.rentalType = rentalType;
+  if (rentalType && rentalType !== "All") filter.rentalType = rentalType;
   if (minPrice || maxPrice) filter.price = { ...(minPrice && { $gte: Number(minPrice) }), ...(maxPrice && { $lte: Number(maxPrice) }) };
   if (availability === "Available") filter.quantity = { $gt: 0 };
   if (availability === "Unavailable") filter.quantity = { $lte: 0 };
@@ -202,7 +219,26 @@ app.get("/api/equipment/:id", async (req, res) => {
 });
 app.post("/api/equipment", verifyToken, verifyOwner, async (req, res) => {
   if (!connected(res)) return;
-  const item = await Equipment.create({ ...req.body, ownerId: req.auth.sub, status: "Pending" });
+  const { name, description, category, location, price, rentalType, quantity, condition, brand, model, image, terms } = req.body;
+  if (!name || !category || !location || price == null || !quantity || !image) {
+    return res.status(400).json({ message: "Name, category, location, price, quantity and image are required." });
+  }
+  const item = await Equipment.create({
+    name: String(name).trim(),
+    description: description ? String(description).trim() : "",
+    category,
+    location: String(location).trim(),
+    price: Number(price),
+    rentalType: rentalType || "Daily",
+    quantity: Number(quantity),
+    condition: condition || "Good",
+    brand: brand ? String(brand).trim() : "",
+    model: model ? String(model).trim() : "",
+    image: String(image).trim(),
+    terms: terms ? String(terms).trim() : "",
+    ownerId: req.auth.sub,
+    status: "Pending"
+  });
   res.status(201).json(item);
 });
 app.put("/api/equipment/:id", verifyToken, async (req, res) => {
@@ -210,7 +246,12 @@ app.put("/api/equipment/:id", verifyToken, async (req, res) => {
   const item = await Equipment.findById(req.params.id);
   if (!item) return res.status(404).json({ message: "Equipment not found." });
   if (item.ownerId.toString() !== req.auth.sub && req.auth.role !== "Admin") return res.status(403).json({ message: "Permission denied." });
-  Object.assign(item, req.body);
+  const allowed = ["name", "description", "category", "location", "price", "rentalType", "quantity", "condition", "brand", "model", "image", "terms"];
+  for (const key of allowed) {
+    if (req.body[key] === undefined) continue;
+    if (key === "price" || key === "quantity") item[key] = Number(req.body[key]);
+    else item[key] = typeof req.body[key] === "string" ? req.body[key].trim() : req.body[key];
+  }
   if (req.auth.role !== "Admin") item.status = "Pending";
   await item.save(); res.json(item);
 });
@@ -243,15 +284,34 @@ app.get("/api/favorites", verifyToken, verifyRenter, async (req, res) => {
 app.post("/api/bookings", verifyToken, verifyRenter, async (req, res) => {
   if (!connected(res)) return;
   const { equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes } = req.body;
+  if (!equipmentId || !startDate || !endDate || !quantity || !contactNumber || !deliveryAddress) {
+    return res.status(400).json({ message: "Equipment, dates, quantity, contact number and delivery address are required." });
+  }
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || end < start) {
+    return res.status(400).json({ message: "Please provide a valid rental date range." });
+  }
   const equipment = await Equipment.findById(equipmentId);
   if (!equipment || equipment.status !== "Approved") return res.status(404).json({ message: "Approved equipment not found." });
-  if (Number(quantity) > equipment.quantity) return res.status(400).json({ message: "Requested quantity is not available." });
-  const overlap = await Booking.countDocuments({ equipmentId, paymentStatus: "Paid", bookingStatus: { $ne: "Rejected" }, startDate: { $lt: new Date(endDate) }, endDate: { $gt: new Date(startDate) } });
+  if (Number(quantity) < 1 || Number(quantity) > equipment.quantity) return res.status(400).json({ message: "Requested quantity is not available." });
+  const overlap = await Booking.countDocuments({ equipmentId, paymentStatus: "Paid", bookingStatus: { $ne: "Rejected" }, startDate: { $lt: end }, endDate: { $gt: start } });
   if (overlap > 0) return res.status(409).json({ message: "Equipment is unavailable for the selected dates." });
-  const days = Math.max(1, Math.ceil((new Date(endDate) - new Date(startDate)) / 86400000));
+  const days = Math.max(1, Math.ceil((end - start) / 86400000));
   const unitDays = equipment.rentalType === "Monthly" ? 30 : equipment.rentalType === "Weekly" ? 7 : 1;
   const totalAmount = equipment.price * Math.ceil(days / unitDays) * Number(quantity);
-  const booking = await Booking.create({ customerId: req.auth.sub, ownerId: equipment.ownerId, equipmentId, startDate, endDate, quantity, contactNumber, deliveryAddress, notes, totalAmount });
+  const booking = await Booking.create({
+    customerId: req.auth.sub,
+    ownerId: equipment.ownerId,
+    equipmentId,
+    startDate: start,
+    endDate: end,
+    quantity: Number(quantity),
+    contactNumber: String(contactNumber).trim(),
+    deliveryAddress: String(deliveryAddress).trim(),
+    notes: notes ? String(notes).trim() : "",
+    totalAmount
+  });
   res.status(201).json(booking);
 });
 app.get("/api/customer/rentals", verifyToken, verifyRenter, async (req, res) => {
@@ -270,9 +330,18 @@ app.post("/api/payments/checkout", verifyToken, verifyRenter, async (req, res) =
   if (!booking) return res.status(404).json({ message: "Booking not found." });
   if (booking.customerId.toString() !== req.auth.sub) return res.status(403).json({ message: "Permission denied." });
   const session = await stripe.checkout.sessions.create({
-    mode: "payment", success_url: `${allowedOrigins[0]}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-    cancel_url: `${allowedOrigins[0]}/payment/cancel`, customer_email: (await User.findById(req.auth.sub)).email,
-    line_items: [{ quantity: 1, price_data: { currency: "usd", unit_amount: Math.round(booking.totalAmount * 100), product_data: { name: booking.equipmentId.name } } }],
+    mode: "payment",
+    success_url: `${clientAppUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${clientAppUrl}/payment/cancel?bookingId=${booking._id.toString()}`,
+    customer_email: (await User.findById(req.auth.sub)).email,
+    line_items: [{
+      quantity: 1,
+      price_data: {
+        currency: "usd",
+        unit_amount: Math.round(booking.totalAmount * 100),
+        product_data: { name: booking.equipmentId.name }
+      }
+    }],
     metadata: { bookingId: booking._id.toString(), customerId: req.auth.sub }
   });
   await Payment.create({ bookingId: booking._id, customerId: req.auth.sub, amount: booking.totalAmount, stripeSessionId: session.id, status: "Pending" });
@@ -290,22 +359,41 @@ app.post("/api/payments/verify", verifyToken, verifyRenter, async (req, res) => 
   res.json({ booking, status: "paid" });
 });
 
-app.get("/api/admin/users", verifyToken, verifyAdmin, async (_req, res) => res.json(await User.find().sort({ createdAt: -1 })));
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (_req, res) => {
+  if (!connected(res)) return;
+  const users = await User.find().sort({ createdAt: -1 });
+  res.json(users.map(publicUser));
+});
 app.put("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+  if (!connected(res)) return;
   if (!["Customer", "Owner", "Admin"].includes(req.body.role)) return res.status(400).json({ message: "Invalid role." });
+  if (req.params.id === req.auth.sub && req.body.role !== "Admin") {
+    return res.status(400).json({ message: "You cannot remove your own admin role." });
+  }
   const user = await User.findByIdAndUpdate(req.params.id, { role: req.body.role }, { new: true });
+  if (!user) return res.status(404).json({ message: "User not found." });
   res.json(publicUser(user));
 });
-app.get("/api/admin/equipment", verifyToken, verifyAdmin, async (_req, res) => res.json(await Equipment.find().populate("ownerId", "name email").sort({ createdAt: -1 })));
-app.put("/api/admin/equipment/:id/status", verifyToken, verifyAdmin, async (req, res) => {
-  if (!["Pending", "Approved", "Rejected"].includes(req.body.status)) return res.status(400).json({ message: "Invalid status." });
-  res.json(await Equipment.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true }));
+app.get("/api/admin/equipment", verifyToken, verifyAdmin, async (_req, res) => {
+  if (!connected(res)) return;
+  res.json(await Equipment.find().populate("ownerId", "name email").sort({ createdAt: -1 }));
 });
-app.get("/api/admin/rentals", verifyToken, verifyAdmin, async (_req, res) => res.json(await Booking.find().populate("customerId", "name email").populate("ownerId", "name email").populate("equipmentId").sort({ createdAt: -1 })));
+app.put("/api/admin/equipment/:id/status", verifyToken, verifyAdmin, async (req, res) => {
+  if (!connected(res)) return;
+  if (!["Pending", "Approved", "Rejected"].includes(req.body.status)) return res.status(400).json({ message: "Invalid status." });
+  const item = await Equipment.findByIdAndUpdate(req.params.id, { status: req.body.status }, { new: true });
+  if (!item) return res.status(404).json({ message: "Equipment not found." });
+  res.json(item);
+});
+app.get("/api/admin/rentals", verifyToken, verifyAdmin, async (_req, res) => {
+  if (!connected(res)) return;
+  res.json(await Booking.find().populate("customerId", "name email").populate("ownerId", "name email").populate("equipmentId").sort({ createdAt: -1 }));
+});
 
 app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_req, res) => {
   if (!connected(res)) return;
-  const [totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals, paidPayments, monthlyBookings] = await Promise.all([
+  const since = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000);
+  const [totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals, paidPayments, monthlyBookings, monthlyRevenue] = await Promise.all([
     User.countDocuments(),
     Equipment.countDocuments(),
     Booking.countDocuments(),
@@ -313,16 +401,23 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (_req, res) => {
     Booking.countDocuments({ bookingStatus: "Completed" }),
     Payment.aggregate([{ $match: { status: "Paid" } }, { $group: { _id: null, total: { $sum: "$amount" } } }]),
     Booking.aggregate([
-      { $match: { createdAt: { $gte: new Date(Date.now() - 180 * 24 * 60 * 60 * 1000) } } },
+      { $match: { createdAt: { $gte: since } } },
       { $group: { _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } }, bookings: { $sum: 1 } } },
       { $sort: { "_id.year": 1, "_id.month": 1 } },
       { $project: { _id: 0, month: { $concat: [{ $toString: "$_id.year" }, "-", { $toString: "$_id.month" }] }, bookings: 1 } }
+    ]),
+    Payment.aggregate([
+      { $match: { status: "Paid", createdAt: { $gte: since } } },
+      { $group: { _id: { year: { $year: "$createdAt" }, month: { $month: "$createdAt" } }, revenue: { $sum: "$amount" } } },
+      { $sort: { "_id.year": 1, "_id.month": 1 } },
+      { $project: { _id: 0, month: { $concat: [{ $toString: "$_id.year" }, "-", { $toString: "$_id.month" }] }, revenue: 1 } }
     ])
   ]);
   res.json({
     totalUsers, totalEquipment, totalBookings, pendingApprovals, completedRentals,
     totalRevenue: paidPayments[0]?.total || 0,
-    monthlyBookings
+    monthlyBookings,
+    monthlyRevenue
   });
 });
 
