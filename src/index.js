@@ -12,12 +12,15 @@ import { betterAuthInstance, betterAuthMongoClient } from "./better-auth.js";
 const app = express();
 const port = process.env.PORT || 5000;
 const configuredOrigins = (process.env.CLIENT_URL || "").split(",").map((x) => x.trim()).filter(Boolean);
+const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null;
 const allowedOrigins = new Set([
   "http://localhost:3000",
   "http://localhost:3001",
   "http://127.0.0.1:3000",
   "http://127.0.0.1:3001",
-  ...configuredOrigins
+  ...configuredOrigins,
+  ...(process.env.BETTER_AUTH_URL ? [process.env.BETTER_AUTH_URL] : []),
+  ...(vercelUrl ? [vercelUrl] : [])
 ]);
 const jwtSecret = process.env.JWT_SECRET;
 const googleClient = process.env.GOOGLE_CLIENT_ID ? new OAuth2Client(process.env.GOOGLE_CLIENT_ID) : null;

@@ -6,6 +6,8 @@ import { MongoClient } from "mongodb";
 
 const mongoUri = process.env.MONGODB_URI;
 export const betterAuthMongoClient = mongoUri ? new MongoClient(mongoUri) : null;
+const vercelUrl = process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null;
+const betterAuthUrl = process.env.BETTER_AUTH_URL || vercelUrl;
 const configuredOrigins = (process.env.CLIENT_URL || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -19,11 +21,13 @@ const localOrigins = [
 
 export const betterAuthInstance = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET || process.env.JWT_SECRET,
-  baseURL: process.env.BETTER_AUTH_URL,
+  baseURL: betterAuthUrl,
   basePath: "/api/better-auth",
   trustedOrigins: [
     ...localOrigins,
-    ...configuredOrigins
+    ...configuredOrigins,
+    ...(betterAuthUrl ? [betterAuthUrl] : []),
+    ...(vercelUrl ? [vercelUrl] : [])
   ],
   database: betterAuthMongoClient
     ? mongodbAdapter(betterAuthMongoClient.db(process.env.MONGODB_DATABASE || "equiply"), {
