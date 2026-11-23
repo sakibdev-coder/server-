@@ -104,6 +104,19 @@ function tokenFor(user) { if (!jwtSecret) throw new Error("JWT_SECRET is not con
 function publicUser(user) { return { id: user._id.toString(), name: user.name, email: user.email, photo: user.photo, phone: user.phone, address: user.address, role: user.role, createdAt: user.createdAt }; }
 function connected(res) { if (mongoose.connection.readyState !== 1) { res.status(503).json({ message: "MongoDB is not connected." }); return false; } return true; }
 
+app.get("/", (req, res) => {
+  const clientOrigin = (process.env.CLIENT_URL || "").split(",")[0]?.trim();
+  if (req.query.error && clientOrigin) {
+    const error = encodeURIComponent(String(req.query.error));
+    return res.redirect(`${clientOrigin}/login?error=${error}`);
+  }
+  return res.json({
+    name: "Equiply API",
+    status: "ok",
+    health: "/api/health",
+    docs: "Use /api/* routes from the client app."
+  });
+});
 app.get("/api/health", (_req, res) => res.json({ status: "ok", database: mongoose.connection.readyState === 1 ? "connected" : "demo" }));
 
 app.post("/api/auth/register", async (req, res, next) => {

@@ -1,6 +1,6 @@
 # Equiply Server
 
-**Project name:** Equiply — Equipment Rental Platform API  
+**Project name:** Equiply — Equipment Rental Platform API
 **Purpose:** Express + MongoDB backend for authentication, equipment listings, bookings, Stripe payments, favorites, and role-based admin/owner/customer APIs.
 
 ## Live URL

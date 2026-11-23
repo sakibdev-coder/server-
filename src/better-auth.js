@@ -19,6 +19,9 @@ const localOrigins = [
   "http://127.0.0.1:3001"
 ];
 
+const isProd = process.env.NODE_ENV === "production" || Boolean(process.env.VERCEL);
+const primaryClient = configuredOrigins[0];
+
 export const betterAuthInstance = betterAuth({
   secret: process.env.BETTER_AUTH_SECRET || process.env.JWT_SECRET,
   baseURL: betterAuthUrl,
@@ -57,6 +60,16 @@ export const betterAuthInstance = betterAuth({
       phone: { type: "string", required: false, defaultValue: "" },
       address: { type: "string", required: false, defaultValue: "" }
     }
+  },
+  advanced: {
+    defaultCookieAttributes: {
+      sameSite: isProd ? "none" : "lax",
+      secure: isProd,
+      partitioned: isProd
+    }
+  },
+  onAPIError: {
+    errorURL: primaryClient ? `${primaryClient}/login` : undefined
   },
   plugins: [jwt()]
 });
