@@ -74,6 +74,7 @@ API base: `http://localhost:5001/api`
 ## Scripts
 
 - `npm run dev` — watch mode
+- `npm run seed` — create / verify Admin and Owner accounts in MongoDB
 - `npm start` — production start
 
 ## Security Notes

@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
+    "seed": "node scripts/seed_accounts.js",
     "start": "node src/index.js"
   },
   "dependencies": {

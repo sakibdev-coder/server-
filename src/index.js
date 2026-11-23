@@ -29,7 +29,7 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
 
 app.use(cors({
   origin(origin, callback) {
-    if (!origin || allowedOrigins.has(origin)) return callback(null, true);
+    if (!origin || allowedOrigins.has(origin) || origin.endsWith(".vercel.app")) return callback(null, true);
     callback(new Error("Origin is not allowed"));
   },
   credentials: true
@@ -103,6 +103,193 @@ function verifyAdmin(req, res, next) { return req.auth?.role === "Admin" ? next(
 function tokenFor(user) { if (!jwtSecret) throw new Error("JWT_SECRET is not configured."); return jwt.sign({ sub: user._id.toString(), role: user.role }, jwtSecret, { expiresIn: "7d" }); }
 function publicUser(user) { return { id: user._id.toString(), name: user.name, email: user.email, photo: user.photo, phone: user.phone, address: user.address, role: user.role, createdAt: user.createdAt }; }
 function connected(res) { if (mongoose.connection.readyState !== 1) { res.status(503).json({ message: "MongoDB is not connected." }); return false; } return true; }
+
+const DEFAULT_EQUIPMENT = [
+  {
+    name: "Sony A7 IV Camera Kit",
+    description: "Full-frame mirrorless camera with 28-70mm lens, spare battery, and carry case.",
+    category: "Photography Equipment",
+    location: "Dhanmondi, Dhaka",
+    price: 45,
+    rentalType: "Daily",
+    quantity: 3,
+    condition: "Excellent",
+    brand: "Sony",
+    model: "A7 IV",
+    image: "https://images.unsplash.com/photo-1516035069371-29a1b244cc32?auto=format&fit=crop&w=1000&q=85",
+    terms: "Return with all accessories. Security deposit may apply for damage.",
+    status: "Approved",
+    rating: 4.9
+  },
+  {
+    name: "Makita Cordless Drill Set",
+    description: "Brushless drill driver with two batteries and bit kit for construction projects.",
+    category: "Construction Equipment",
+    location: "Banani, Dhaka",
+    price: 18,
+    rentalType: "Daily",
+    quantity: 5,
+    condition: "Good",
+    brand: "Makita",
+    model: "DHP484",
+    image: "https://images.unsplash.com/photo-1504148455328-c376907d081c?auto=format&fit=crop&w=1000&q=85",
+    terms: "Clean before return. Late fees apply after the booked period.",
+    status: "Approved",
+    rating: 4.8
+  },
+  {
+    name: "Event LED Light Pair",
+    description: "Two portable LED panels with stands, ideal for indoor events and content shoots.",
+    category: "Event Equipment",
+    location: "Gulshan, Dhaka",
+    price: 30,
+    rentalType: "Daily",
+    quantity: 4,
+    condition: "Like New",
+    brand: "Godox",
+    model: "SL60W",
+    image: "https://images.unsplash.com/photo-1514525253161-7a46d19cd819?auto=format&fit=crop&w=1000&q=85",
+    terms: "Include stands and power cables. Outdoor use only with weather protection.",
+    status: "Approved",
+    rating: 4.7
+  },
+  {
+    name: "Compact Utility Van",
+    description: "City-friendly van for short hauls and weekend moves.",
+    category: "Vehicles & Transportation",
+    location: "Mirpur, Dhaka",
+    price: 65,
+    rentalType: "Daily",
+    quantity: 2,
+    condition: "Good",
+    brand: "Toyota",
+    model: "HiAce",
+    image: "https://images.unsplash.com/photo-1449965408869-eaa3f722e40d?auto=format&fit=crop&w=1000&q=85",
+    terms: "Fuel not included. Return with a full tank.",
+    status: "Approved",
+    rating: 4.6
+  },
+  {
+    name: "Portable Projector Bundle",
+    description: "1080p projector with screen and HDMI cables for classrooms and events.",
+    category: "Electronics",
+    location: "Uttara, Dhaka",
+    price: 26,
+    rentalType: "Daily",
+    quantity: 6,
+    condition: "Excellent",
+    brand: "Epson",
+    model: "EH-TW700",
+    image: "https://images.unsplash.com/photo-1498049794561-7780e7231661?auto=format&fit=crop&w=1000&q=85",
+    terms: "Handle with care. Missing accessories incur replacement fees.",
+    status: "Approved",
+    rating: 4.85
+  },
+  {
+    name: "Garden Tiller Compact",
+    description: "Lightweight tiller for small farms and backyard soil prep.",
+    category: "Agriculture Equipment",
+    location: "Savar, Dhaka",
+    price: 22,
+    rentalType: "Daily",
+    quantity: 3,
+    condition: "Good",
+    brand: "Honda",
+    model: "FG110",
+    image: "https://images.unsplash.com/photo-1625246333195-78d9c38ad449?auto=format&fit=crop&w=1000&q=85",
+    terms: "Clean soil from blades before return.",
+    status: "Approved",
+    rating: 4.5
+  }
+];
+
+export async function ensureSeedData() {
+  try {
+    const adminAccounts = [
+      { name: "Equiply Admin", email: "admin@equiply.test", password: "Admin123" },
+      { name: "Equiply Admin", email: "admin@equiply.com", password: "Admin123" }
+    ];
+    for (const acc of adminAccounts) {
+      const existing = await User.findOne({ email: acc.email });
+      if (!existing) {
+        await User.create({
+          name: acc.name,
+          email: acc.email,
+          passwordHash: await bcrypt.hash(acc.password, 12),
+          role: "Admin",
+          phone: "+8801600000000",
+          address: "Dhaka, Bangladesh"
+        });
+      } else if (existing.role !== "Admin") {
+        existing.role = "Admin";
+        existing.passwordHash = await bcrypt.hash(acc.password, 12);
+        await existing.save();
+      }
+    }
+
+    const ownerAccounts = [
+      { name: "Demo Owner", email: "owner@equiply.test", password: "Owner123" },
+      { name: "Demo Owner", email: "owner@equiply.com", password: "Owner123" }
+    ];
+    let primaryOwner = null;
+    for (const acc of ownerAccounts) {
+      let existing = await User.findOne({ email: acc.email });
+      if (!existing) {
+        existing = await User.create({
+          name: acc.name,
+          email: acc.email,
+          passwordHash: await bcrypt.hash(acc.password, 12),
+          role: "Owner",
+          phone: "+8801700000000",
+          address: "Dhaka, Bangladesh"
+        });
+      } else if (existing.role !== "Owner") {
+        existing.role = "Owner";
+        existing.passwordHash = await bcrypt.hash(acc.password, 12);
+        await existing.save();
+      }
+      if (!primaryOwner && acc.email === "owner@equiply.test") primaryOwner = existing;
+    }
+    if (!primaryOwner) primaryOwner = await User.findOne({ role: "Owner" });
+
+    const equipmentCount = await Equipment.countDocuments();
+    if (equipmentCount === 0 && primaryOwner) {
+      for (const item of DEFAULT_EQUIPMENT) {
+        await Equipment.create({ ...item, ownerId: primaryOwner._id });
+      }
+    }
+  } catch (err) {
+    console.error("Auto-seed error:", err.message);
+  }
+}
+
+let dbPromise = null;
+export async function ensureDb() {
+  if (mongoose.connection.readyState === 1) return;
+  if (!dbPromise && process.env.MONGODB_URI) {
+    dbPromise = (async () => {
+      await mongoose.connect(process.env.MONGODB_URI, {
+        dbName: process.env.MONGODB_DATABASE || "equiply"
+      });
+      if (betterAuthMongoClient) {
+        try { await betterAuthMongoClient.connect(); } catch (e) { /* ignore */ }
+      }
+      await ensureSeedData();
+    })().finally(() => {
+      dbPromise = null;
+    });
+  }
+  if (dbPromise) await dbPromise;
+}
+
+app.use(async (_req, _res, next) => {
+  try {
+    await ensureDb();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
 
 app.get("/", (req, res) => {
   const clientOrigin = (process.env.CLIENT_URL || "").split(",")[0]?.trim();
@@ -465,17 +652,38 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, async (req, res) => {
   });
 });
 
+app.get("/api/seed", async (_req, res, next) => {
+  try {
+    await ensureDb();
+    await ensureSeedData();
+    const [admins, owners, equipmentCount] = await Promise.all([
+      User.find({ role: "Admin" }, "email role name"),
+      User.find({ role: "Owner" }, "email role name"),
+      Equipment.countDocuments()
+    ]);
+    res.json({
+      message: "Seed completed successfully.",
+      admins,
+      owners,
+      equipmentCount
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use("/api", (_req, res) => res.status(404).json({ message: "API route not found." }));
 app.use((error, _req, res, _next) => { console.error(error); res.status(error.message === "Origin is not allowed" ? 403 : 500).json({ message: error.message === "Origin is not allowed" ? error.message : "Something went wrong." }); });
 
 async function start() {
-  if (process.env.MONGODB_URI) {
-    try {
-      await mongoose.connect(process.env.MONGODB_URI);
-      if (betterAuthMongoClient) await betterAuthMongoClient.connect();
-      console.log("Connected to MongoDB");
-    } catch (error) { console.error(error.message); process.exit(1); }
+  try {
+    await ensureDb();
+    console.log("Connected to MongoDB & verified seed data");
+  } catch (error) {
+    console.error("MongoDB start error:", error.message);
   }
   app.listen(port, () => console.log(`Equiply API listening on ${port}`));
 }
 start();
+
+export default app;
